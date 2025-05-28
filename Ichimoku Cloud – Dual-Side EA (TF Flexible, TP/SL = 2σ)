@@ -1,0 +1,97 @@
+//+------------------------------------------------------------------+
+//|  Ichimoku Cloud – Dual-Side EA (TF Flexible, TP/SL = 2σ)        |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+input double LotSize = 0.01;
+input int Slippage = 3;
+input int MaxTrades = 5;
+
+int hIchimoku = INVALID_HANDLE;
+int hStdDev = INVALID_HANDLE;
+datetime lastBar = 0;
+
+int OnInit()
+{
+   hIchimoku = iIchimoku(_Symbol, _Period, 9, 26, 52);
+   if(hIchimoku == INVALID_HANDLE) return INIT_FAILED;
+   hStdDev = iStdDev(_Symbol, _Period, 80, 0, MODE_SMA, PRICE_CLOSE);
+   if(hStdDev == INVALID_HANDLE) return INIT_FAILED;
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int)
+{
+   if(hIchimoku != INVALID_HANDLE) IndicatorRelease(hIchimoku);
+   if(hStdDev != INVALID_HANDLE) IndicatorRelease(hStdDev);
+}
+
+void OnTick()
+{
+   datetime barTime = iTime(_Symbol, _Period, 0);
+   if(barTime == lastBar) return;
+   lastBar = barTime;
+   if(Bars(_Symbol, _Period) < 100) return;
+
+   double spanA[1], spanB[1];
+   if(CopyBuffer(hIchimoku, 2, 26, 1, spanA) <= 0) return;
+   if(CopyBuffer(hIchimoku, 3, 26, 1, spanB) <= 0) return;
+
+   double tenkan[1], kijun[1];
+   if(CopyBuffer(hIchimoku, 0, 0, 1, tenkan) <= 0) return;
+   if(CopyBuffer(hIchimoku, 1, 0, 1, kijun ) <= 0) return;
+
+   double sdBuf[1];
+   if(CopyBuffer(hStdDev, 0, 0, 1, sdBuf) <= 0) return;
+   double sigma = sdBuf[0];
+   if(sigma <= 5 * _Point) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(spanA[0] > spanB[0] && ask > iClose(_Symbol, _Period, 26) && tenkan[0] > kijun[0])
+   {
+      double tpBuy = NormalizeDouble(ask + 2.0 * sigma, _Digits);
+      double slBuy = NormalizeDouble(ask - 2.0 * sigma, _Digits);
+      if(!HitTradeLimit() && StpOK(ask, slBuy, tpBuy))
+         PlaceOrder(ORDER_TYPE_BUY, LotSize, slBuy, tpBuy, sigma);
+   }
+
+   if(spanA[0] < spanB[0] && bid < iClose(_Symbol, _Period, 26) && tenkan[0] < kijun[0])
+   {
+      double tpSell = NormalizeDouble(bid - 2.0 * sigma, _Digits);
+      double slSell = NormalizeDouble(bid + 2.0 * sigma, _Digits);
+      if(!HitTradeLimit() && StpOK(bid, slSell, tpSell))
+         PlaceOrder(ORDER_TYPE_SELL, LotSize, slSell, tpSell, sigma);
+   }
+}
+
+bool HitTradeLimit()
+{
+   int cnt = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol) cnt++;
+   }
+   return (cnt >= MaxTrades);
+}
+
+bool StpOK(double price, double sl, double tp)
+{
+   double min = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   return (MathAbs(price - sl) >= min && MathAbs(tp - price) >= min);
+}
+
+void PlaceOrder(int dir, double vol, double sl, double tp, double sigma)
+{
+   string cmt = StringFormat("sigma=%.1f", sigma / _Point);
+   trade.SetDeviationInPoints(Slippage);
+   bool ok = (dir == ORDER_TYPE_BUY)
+           ? trade.Buy (vol, NULL, 0, sl, tp, cmt)
+           : trade.Sell(vol, NULL, 0, sl, tp, cmt);
+   if(!ok) Print("Order failed: ", GetLastError());
+}
