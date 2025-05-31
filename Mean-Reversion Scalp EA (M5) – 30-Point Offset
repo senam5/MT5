@@ -1,0 +1,210 @@
+//+------------------------------------------------------------------+
+//|        Mean-Reversion Scalp EA (M5) – 30-Point Offset           |
+//|                   © 2025 Senam Magezi Gbekou                     |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//–– USER INPUTS –––––––––––––––––––––––––––––––––––––––––––––––––––
+// Position sizing & risk
+input double Lots               = 0.10;   // Lot size per trade
+input int    Slippage           = 3;      // Maximum slippage in points
+input int    MaxTradesPerDir    = 5;      // Max open buys or sells at once
+input double KillSwitchLoss     = 100.0;  // Daily net loss (account currency) to stop entries
+input int    EntryOffsetPoints  = 30;     // Wait 30 points beyond BB before entry
+
+//–– Bollinger Bands Settings –––––––––––––––––––––––––––––––––––––––
+input int    BB_Period    = 20;    // Period for Bollinger Bands
+input double BB_Deviation = 2.0;   // StdDev multiplier
+
+//–– Parabolic SAR Settings –––––––––––––––––––––––––––––––––––––––––
+input double SAR_Step     = 0.02;  // SAR step
+input double SAR_Maximum  = 0.2;   // SAR maximum
+
+//–– SL/TP Settings (in points) –––––––––––––––––––––––––––––––––––––
+input double MR_TakeProfit = 10;   // Take profit in points (e.g. 10 points = 1.0 pip on 5-digit)
+input double MR_StopLoss   = 7;    // Stop loss in points
+
+//–– INTERNAL HANDLES & VARIABLES –––––––––––––––––––––––––––––––––––
+int      hBB               = INVALID_HANDLE;   // Bollinger Bands handle
+int      hSAR              = INVALID_HANDLE;   // Parabolic SAR handle
+bool     initialized       = false;
+datetime lastTradeBarTime  = 0;               // for one‐entry‐per‐bar guard
+datetime lastTradeTime     = 0;               // for cool-down (if desired)
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   // Create Bollinger Bands handle (buffers: 0=Upper, 1=Middle, 2=Lower)
+   hBB  = iBands(_Symbol, PERIOD_M5, BB_Period, (int)BB_Deviation, 0, PRICE_CLOSE);
+   // Create Parabolic SAR handle
+   hSAR = iSAR(_Symbol, PERIOD_M5, SAR_Step, SAR_Maximum);
+   
+   if(hBB == INVALID_HANDLE || hSAR == INVALID_HANDLE)
+     {
+      Print("Error creating indicator handles for BB or SAR");
+      return(INIT_FAILED);
+     }
+   
+   initialized = true;
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(hBB  != INVALID_HANDLE) IndicatorRelease(hBB);
+   if(hSAR != INVALID_HANDLE) IndicatorRelease(hSAR);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(!initialized) 
+      return;
+   
+   // 1) Wait until there are at least BB_Period+5 M5 bars
+   if(iBars(_Symbol, PERIOD_M5) < BB_Period + 5)
+      return;
+   
+   // 2) Kill-switch: if today's net P/L ≤ –KillSwitchLoss, stop entries
+   if(GetTodaysNetPL() <= -KillSwitchLoss)
+      return;
+   
+   // 3) Only one trade per 5-minute candle
+   datetime thisBarTime = iTime(_Symbol, PERIOD_M5, 0);
+   if(thisBarTime == lastTradeBarTime)
+      return;
+   
+   // 4) (Optional) Add a cool-down between trades
+   //    Uncomment if you want to enforce a minimum seconds-between entries:
+   // if(TimeCurrent() - lastTradeTime < CoolDownSeconds)
+   //    return;
+   
+   // 5) Count open positions per side
+   int buysOpen  = CountOpenPositions(ORDER_TYPE_BUY);
+   int sellsOpen = CountOpenPositions(ORDER_TYPE_SELL);
+   
+   // 6) Run mean-reversion logic; if a trade is placed, update timestamps
+   bool didTrade = MeanReversionLogic(buysOpen, sellsOpen);
+   if(didTrade)
+     {
+      lastTradeBarTime = thisBarTime;
+      lastTradeTime    = TimeCurrent();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Count how many open positions of a given type exist             |
+//+------------------------------------------------------------------+
+int CountOpenPositions(const ENUM_ORDER_TYPE type)
+  {
+   int count = 0;
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      if(PositionGetSymbol(i) == _Symbol &&
+         (ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE) == type)
+         count++;
+     }
+   return(count);
+  }
+
+//+------------------------------------------------------------------+
+//| Calculate today's net profit/loss (negative if losing)          |
+//+------------------------------------------------------------------+
+double GetTodaysNetPL()
+  {
+   static datetime lastDay     = 0;
+   static double   cumulProfit = 0.0;
+   
+   datetime now = TimeCurrent();
+   MqlDateTime tm; 
+   TimeToStruct(now, tm);
+   
+   // Build midnight of current day
+   MqlDateTime zeroTime;
+   zeroTime.year  = tm.year;
+   zeroTime.mon   = tm.mon;
+   zeroTime.day   = tm.day;
+   zeroTime.hour  = 0;
+   zeroTime.min   = 0;
+   zeroTime.sec   = 0;
+   datetime todayStart = StructToTime(zeroTime);
+   
+   if(todayStart != lastDay)
+     {
+      lastDay     = todayStart;
+      cumulProfit = 0.0;
+      
+      HistorySelect(todayStart, now);
+      for(int i=0; i<HistoryDealsTotal(); i++)
+        {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            cumulProfit += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+        }
+     }
+   return(cumulProfit);
+  }
+
+//+------------------------------------------------------------------+
+//| Mean-Reversion Logic with 30-Point Offset                        |
+//+------------------------------------------------------------------+
+bool MeanReversionLogic(int buysOpen, int sellsOpen)
+  {
+   double upperBB[1], middleBB[1], lowerBB[1], sarVal[1];
+   if(CopyBuffer(hBB, 0, 0, 1, upperBB)   <= 0) return false;  // buffer 0 = Upper
+   if(CopyBuffer(hBB, 1, 0, 1, middleBB)  <= 0) return false;  // buffer 1 = Middle
+   if(CopyBuffer(hBB, 2, 0, 1, lowerBB)   <= 0) return false;  // buffer 2 = Lower
+   if(CopyBuffer(hSAR, 0, 0, 1, sarVal)    <= 0) return false;  // buffer 0 = SAR
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // Calculate the 30-point offset in price terms
+   double offset = EntryOffsetPoints * _Point;
+   
+   // 1) BUY if: 
+   //    a) bid < (lowerBB – 30 points), 
+   //    b) SAR is still above price (sarVal > bid), 
+   //    c) buysOpen < MaxTradesPerDir
+   if(buysOpen < MaxTradesPerDir &&
+      bid < lowerBB[0] - offset &&
+      sarVal[0] > bid)
+     {
+      trade.SetDeviationInPoints(Slippage);
+      if(trade.Buy(Lots,
+                   _Symbol,
+                   ask,
+                   ask - MR_StopLoss  * _Point,   // StopLoss
+                   ask + MR_TakeProfit * _Point)) // TakeProfit
+         return true;
+     }
+   
+   // 2) SELL if:
+   //    a) ask > (upperBB + 30 points), 
+   //    b) SAR is still below price (sarVal < ask), 
+   //    c) sellsOpen < MaxTradesPerDir
+   if(sellsOpen < MaxTradesPerDir &&
+      ask > upperBB[0] + offset &&
+      sarVal[0] < ask)
+     {
+      trade.SetDeviationInPoints(Slippage);
+      if(trade.Sell(Lots,
+                    _Symbol,
+                    bid,
+                    bid + MR_StopLoss  * _Point,   // StopLoss
+                    bid - MR_TakeProfit * _Point)) // TakeProfit
+         return true;
+     }
+   
+   // No order placed this bar
+   return false;
+  }
