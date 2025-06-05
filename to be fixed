@@ -1,0 +1,260 @@
+//+------------------------------------------------------------------+
+//| FIXED Ichimoku EA with Asian Session Avoidance                   |
+//| - Fixed daily reset functionality                                |
+//| - Improved time handling                                         |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- Main Inputs ---
+input double LotSize            = 0.01;    // Base lot size
+input double Daily_Target_Pct   = 1.0;     // Daily profit target (%)
+input double Daily_SL_Pct       = 75.0;    // Max daily loss (% of target)
+input double FixedPips          = 25.0;    // Take profit (pips)
+input double Fixed_SL_Pips      = 50.0;    // Stop loss (pips)
+input int    Slippage           = 3;       // Max slippage
+
+//--- Time Filter Inputs ---
+input bool   AvoidAsianSession  = true;    // Enable Asian session filter
+input int    AsianSessionStart  = 0;       // Start hour (GMT)
+input int    AsianSessionEnd    = 9;       // End hour (GMT)
+
+//--- Volatility Filter Inputs ---
+input bool   UseVolatilityFilter= true;    // Enable volatility filter
+input int    SD_Period          = 14;      // Lookback period for σ
+input double Min_Standard_Deviation = 15.0; // Min σ in pips
+
+//--- Globals ---
+int      hIchimoku = INVALID_HANDLE;
+datetime lastBar    = 0;
+double   dayStartEquity;
+double   dailyProfitTarget;
+double   dailyStopLossLevel;
+bool     dailyTargetReached;
+bool     dailyStopHit;
+int      lastDayOfYear = -1;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hIchimoku = iIchimoku(_Symbol, _Period, 9, 26, 52);
+   if(hIchimoku == INVALID_HANDLE) 
+   {
+      Print("Ichimoku init failed: ", GetLastError());
+      return INIT_FAILED;
+   }
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(hIchimoku != INVALID_HANDLE) IndicatorRelease(hIchimoku);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate proper lot size                                       |
+//+------------------------------------------------------------------+
+double AdjustLot(double rawLot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   rawLot = MathMax(minLot, MathMin(maxLot, rawLot));
+   return MathFloor(rawLot / lotStep) * lotStep;
+}
+
+//+------------------------------------------------------------------+
+//| Check volatility conditions                                      |
+//+------------------------------------------------------------------+
+bool IsVolatilitySufficient()
+{
+   if(!UseVolatilityFilter) return true;
+   
+   const int daysNeeded = SD_Period + 1;
+   double dailyCloses[];
+   ArraySetAsSeries(dailyCloses, true);
+   
+   if(CopyClose(_Symbol, PERIOD_D1, 1, daysNeeded, dailyCloses) < daysNeeded)
+      return false;
+
+   // Calculate daily returns
+   double returns[], sum = 0.0;
+   ArrayResize(returns, SD_Period);
+   
+   for(int i = 0; i < SD_Period; i++)
+   {
+      returns[i] = (dailyCloses[i] - dailyCloses[i+1]) / dailyCloses[i+1];
+      sum += returns[i];
+   }
+
+   // Compute standard deviation in pips
+   double mean = sum / SD_Period;
+   double sqSum = 0.0;
+   for(int i = 0; i < SD_Period; i++)
+      sqSum += MathPow(returns[i] - mean, 2);
+   
+   double sigmaReturn = MathSqrt(sqSum / (SD_Period - 1));
+   double currentSD_Pips = (SymbolInfoDouble(_Symbol, SYMBOL_BID) * sigmaReturn) / _Point;
+   
+   return (currentSD_Pips >= Min_Standard_Deviation);
+}
+
+//+------------------------------------------------------------------+
+//| Main trading logic (FIXED DAILY RESET)                          |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1) Skip Asian session if enabled
+   if(AvoidAsianSession)
+   {
+      MqlDateTime timeGMT;
+      TimeGMT(timeGMT); // Use GMT time directly
+      int currentHourGMT = timeGMT.hour;
+      
+      if(currentHourGMT >= AsianSessionStart && currentHourGMT < AsianSessionEnd)
+      {
+         Comment("Asian Session (", AsianSessionStart, ":00-", AsianSessionEnd, ":00 GMT) - No Trading");
+         return;
+      }
+   }
+
+   // 2) Daily reset (FIXED - using proper date comparison)
+   MqlDateTime dtNow;
+   TimeCurrent(dtNow);
+   int currentDayOfYear = dtNow.day_of_year;
+   int currentYear = dtNow.year;
+   
+   // Check if new trading day (year change handled properly)
+   if(currentDayOfYear != lastDayOfYear || currentYear != (lastDayOfYear > 0 ? lastDayOfYear/365 : 0))
+   {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      dailyProfitTarget = dayStartEquity * (Daily_Target_Pct/100.0);
+      dailyStopLossLevel = dayStartEquity - (dailyProfitTarget * (Daily_SL_Pct/100.0));
+      dailyTargetReached = false;
+      dailyStopHit = false;
+      lastDayOfYear = currentDayOfYear;
+      PrintFormat("=== New Day %04d.%02d.%02d — Equity: %.2f ===",
+                  dtNow.year, dtNow.mon, dtNow.day, dayStartEquity);
+   }
+
+   // 3) Skip if target reached or stop loss hit
+   if(dailyTargetReached || dailyStopHit) return;
+   
+   // 4) Check daily limits
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(currentEquity >= dayStartEquity + dailyProfitTarget)
+   {
+      Print("Daily target reached! Closing positions.");
+      CloseAllPositions();
+      dailyTargetReached = true;
+      return;
+   }
+   else if(currentEquity <= dailyStopLossLevel)
+   {
+      Print("Daily STOP LOSS hit! Closing positions.");
+      CloseAllPositions();
+      dailyStopHit = true;
+      return;
+   }
+
+   // 5) New bar check
+   datetime barTime = iTime(_Symbol, _Period, 0);
+   if(barTime == lastBar) return;
+   lastBar = barTime;
+
+   // 6) Volatility filter
+   if(UseVolatilityFilter && !IsVolatilitySufficient())
+   {
+      Comment("Low Volatility - Waiting...");
+      return;
+   }
+
+   // 7) Get Ichimoku values
+   double tenkan[1], kijun[1], spanA[1], spanB[1];
+   if(CopyBuffer(hIchimoku, 0, 0, 1, tenkan) <= 0) return;
+   if(CopyBuffer(hIchimoku, 1, 0, 1, kijun)  <= 0) return;
+   if(CopyBuffer(hIchimoku, 2, 26, 1, spanA) <= 0) return;
+   if(CopyBuffer(hIchimoku, 3, 26, 1, spanB) <= 0) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // 8) Entry conditions
+   if(spanA[0] > spanB[0] && ask > iClose(_Symbol, _Period, 26) && tenkan[0] > kijun[0])
+      PlaceTrade(ORDER_TYPE_BUY, ask);
+   
+   else if(spanA[0] < spanB[0] && bid < iClose(_Symbol, _Period, 26) && tenkan[0] < kijun[0])
+      PlaceTrade(ORDER_TYPE_SELL, bid);
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade with fixed SL/TP                                  |
+//+------------------------------------------------------------------+
+void PlaceTrade(int type, double price)
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0) return;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double pipValuePerLot = tickValue * 10.0;
+   if(pipValuePerLot <= 0) return;
+
+   double profitTarget = dailyProfitTarget;
+   double rawLot = profitTarget / (pipValuePerLot * FixedPips);
+   double lot = AdjustLot(rawLot);
+   if(lot <= 0) return;
+
+   double slDist = Fixed_SL_Pips * _Point * 10;
+   double tpDist = FixedPips * _Point * 10;
+   
+   double sl = (type == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
+   double tp = (type == ORDER_TYPE_BUY) ? price + tpDist : price - tpDist;
+
+   // Validate stops
+   double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(MathAbs(price - sl) < minStopLevel || MathAbs(tp - price) < minStopLevel)
+   {
+      Print("Stop levels too close. Trade skipped.");
+      return;
+   }
+
+   trade.SetDeviationInPoints(Slippage);
+   bool ok;
+   if(type == ORDER_TYPE_BUY)
+      ok = trade.Buy(lot, NULL, 0, sl, tp, "Ichi_AsiaFilter");
+   else
+      ok = trade.Sell(lot, NULL, 0, sl, tp, "Ichi_AsiaFilter");
+
+   if(!ok)
+      Print("Trade failed: ", GetLastError());
+   else
+      Print("Trade placed: ", type == ORDER_TYPE_BUY ? "BUY" : "SELL", " Lot:", lot);
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                             |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            if(!trade.PositionClose(ticket))
+               Print("Failed to close position: ", GetLastError());
+         }
+      }
+   }
+}
