@@ -1,0 +1,143 @@
+//+------------------------------------------------------------------+
+//| Simplified Ichimoku Cloud EA                                     |
+//| Removed complex filters for more trades                          |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- Inputs ---
+input double LotSize          = 0.01;    // Base lot size
+input double DesiredProfitPct = 1.0;     // Daily target (1%)
+input double FixedPips        = 25.0;    // Take profit (pips)
+input double Fixed_SL_Pips    = 50.0;    // Stop loss (pips) - SIMPLIFIED!
+input int    Slippage         = 3;       // Max slippage
+
+//--- Globals ---
+int      hIchimoku = INVALID_HANDLE;
+datetime lastBar    = 0;
+double   dayStartEquity;
+bool     dailyTargetReached;
+int      lastDayOfYear = -1;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hIchimoku = iIchimoku(_Symbol, _Period, 9, 26, 52);
+   if(hIchimoku == INVALID_HANDLE) return INIT_FAILED;
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(hIchimoku != INVALID_HANDLE) IndicatorRelease(hIchimoku);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate proper lot size                                       |
+//+------------------------------------------------------------------+
+double AdjustLot(double rawLot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   rawLot = MathMax(minLot, MathMin(maxLot, rawLot));
+   return MathFloor(rawLot / lotStep) * lotStep;
+}
+
+//+------------------------------------------------------------------+
+//| Main trading logic                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1) Daily reset
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   if(dt.day_of_year != lastDayOfYear)
+   {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      dailyTargetReached = false;
+      lastDayOfYear = dt.day_of_year;
+      Print("New day started. Equity: ", dayStartEquity);
+   }
+
+   // 2) Skip if target reached
+   if(dailyTargetReached) return;
+   
+   // 3) Check 1% profit target
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(currentEquity >= dayStartEquity * 1.01)
+   {
+      CloseAllPositions();
+      dailyTargetReached = true;
+      return;
+   }
+
+   // 4) New bar check
+   datetime barTime = iTime(_Symbol, _Period, 0);
+   if(barTime == lastBar) return;
+   lastBar = barTime;
+
+   // 5) Get Ichimoku values
+   double tenkan[1], kijun[1], spanA[1], spanB[1];
+   if(CopyBuffer(hIchimoku, 0, 0, 1, tenkan) <= 0) return;
+   if(CopyBuffer(hIchimoku, 1, 0, 1, kijun)  <= 0) return;
+   if(CopyBuffer(hIchimoku, 2, 26, 1, spanA) <= 0) return;
+   if(CopyBuffer(hIchimoku, 3, 26, 1, spanB) <= 0) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // 6) Simplified entry conditions
+   if(spanA[0] > spanB[0] && ask > iClose(_Symbol, _Period, 26) && tenkan[0] > kijun[0])
+      PlaceTrade(ORDER_TYPE_BUY, ask);
+   
+   else if(spanA[0] < spanB[0] && bid < iClose(_Symbol, _Period, 26) && tenkan[0] < kijun[0])
+      PlaceTrade(ORDER_TYPE_SELL, bid);
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade with fixed SL/TP                                  |
+//+------------------------------------------------------------------+
+void PlaceTrade(int type, double price)
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0) return;
+
+   // Calculate lot size
+   double lot = AdjustLot((equity * 0.01) / (FixedPips * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * 10));
+   if(lot <= 0) return;
+
+   // Set SL/TP prices
+   double slDist = Fixed_SL_Pips * _Point * 10;
+   double tpDist = FixedPips * _Point * 10;
+   
+   double sl = (type == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
+   double tp = (type == ORDER_TYPE_BUY) ? price + tpDist : price - tpDist;
+
+   // Execute trade
+   trade.SetDeviationInPoints(Slippage);
+   if(type == ORDER_TYPE_BUY)
+      trade.Buy(lot, NULL, 0, sl, tp, "Ichi_Simple");
+   else
+      trade.Sell(lot, NULL, 0, sl, tp, "Ichi_Simple");
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                             |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+         trade.PositionClose(ticket);
+   }
+}
