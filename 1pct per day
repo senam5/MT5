@@ -1,0 +1,284 @@
+//+------------------------------------------------------------------+
+//| Ichimoku Cloud EA with Volatility Filtering & Logging            |
+//| Targets 1% Daily Profit | Avoids Low-Volatility Conditions       |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- User Inputs ---
+input double LotSize             = 0.01;    // Base lot size
+input double DesiredProfitPct    = 1.0;     // Daily profit target (%)
+input double FixedPips           = 25.0;    // TP distance (pips)
+input double SigmaMultiplier     = 0.50;    // SL multiplier (σ-based)
+input int    Slippage            = 3;       // Max slippage (points)
+
+// Volatility Filter Inputs
+input int     SD_Period          = 14;      // Lookback for σ calculation
+input int     SD_Lookback        = 20;      // Period for avg σ
+input double  SD_Threshold_Mult  = 0.5;     // Threshold multiplier (0.5 = 50% of avg σ)
+input bool    EnableLogging      = true;    // Log to CSV
+
+//--- Globals ---
+int      hIchimoku          = INVALID_HANDLE;
+datetime lastBar            = 0;
+double   dayStartEquity     = 0.0;
+bool     dailyTargetReached = false;
+int      lastDayOfYear      = -1;
+int      logFileHandle      = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize Ichimoku
+   hIchimoku = iIchimoku(_Symbol, _Period, 9, 26, 52);
+   if(hIchimoku == INVALID_HANDLE)
+   {
+      Print("Ichimoku init failed: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   // Initialize log file
+   if(EnableLogging)
+   {
+      logFileHandle = FileOpen("VolatilityLog_" + _Symbol + ".csv", FILE_WRITE|FILE_CSV);
+      if(logFileHandle != INVALID_HANDLE)
+         FileWrite(logFileHandle, "Date", "Time", "CurrentSD", "AvgSD", "Threshold", "Action");
+   }
+
+   lastDayOfYear = -1; // Force daily reset on start
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(hIchimoku != INVALID_HANDLE) IndicatorRelease(hIchimoku);
+   if(logFileHandle != INVALID_HANDLE) FileClose(logFileHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size (safe rounding)                              |
+//+------------------------------------------------------------------+
+double AdjustLot(double rawLot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   rawLot = MathMax(minLot, MathMin(maxLot, rawLot));
+   double lot = MathFloor(rawLot / lotStep) * lotStep;
+   return (lot < minLot) ? minLot : lot;
+}
+
+//+------------------------------------------------------------------+
+//| Check volatility conditions                                      |
+//+------------------------------------------------------------------+
+bool IsVolatilitySufficient()
+{
+   // 1. Get price history
+   const int daysNeeded = MathMax(SD_Period, SD_Lookback) + 1;
+   double dailyCloses[];
+   ArraySetAsSeries(dailyCloses, true);
+   if(CopyClose(_Symbol, PERIOD_D1, 1, daysNeeded, dailyCloses) < daysNeeded)
+   {
+      Print("Error: Not enough data for σ calculation");
+      return false;
+   }
+
+   // 2. Calculate returns and σ
+   double returns[], sum = 0.0, sdSum = 0.0;
+   ArrayResize(returns, daysNeeded - 1);
+   
+   for(int i = 0; i < daysNeeded - 1; i++)
+   {
+      returns[i] = (dailyCloses[i] - dailyCloses[i+1]) / dailyCloses[i+1];
+      sum += returns[i];
+      if(i < SD_Lookback) sdSum += MathAbs(returns[i]);
+   }
+   
+   double mean = sum / (daysNeeded - 1);
+   double sqSum = 0.0;
+   for(int i = 0; i < daysNeeded - 1; i++)
+      sqSum += MathPow(returns[i] - mean, 2);
+   
+   double currentSD = MathSqrt(sqSum / (daysNeeded - 1));
+   double avgSD = sdSum / SD_Lookback;
+   double threshold = avgSD * SD_Threshold_Mult;
+
+   // 3. Log results
+   if(EnableLogging && logFileHandle != INVALID_HANDLE)
+   {
+      MqlDateTime timeNow;
+      TimeCurrent(timeNow);
+      string dateStr = StringFormat("%04d.%02d.%02d", timeNow.year, timeNow.mon, timeNow.day);
+      string timeStr = StringFormat("%02d:%02d", timeNow.hour, timeNow.min);
+      string action = (currentSD >= threshold) ? "Trading" : "Skipped";
+      
+      FileWrite(logFileHandle, 
+         dateStr, timeStr,
+         DoubleToString(currentSD, 6),
+         DoubleToString(avgSD, 6),
+         DoubleToString(threshold, 6),
+         action
+      );
+   }
+
+   return (currentSD >= threshold);
+}
+
+//+------------------------------------------------------------------+
+//| Main tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1. Daily reset logic
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int thisDay = dt.day_of_year;
+   if(thisDay != lastDayOfYear)
+   {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      dailyTargetReached = false;
+      lastDayOfYear = thisDay;
+      PrintFormat("=== New Day %04d.%02d.%02d — Equity: %.2f ===", dt.year, dt.mon, dt.day, dayStartEquity);
+   }
+
+   // 2. Check daily target
+   if(!dailyTargetReached)
+   {
+      double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double target = dayStartEquity * (1 + DesiredProfitPct/100);
+      if(currentEquity >= target)
+      {
+         Print("Daily target reached! Closing all trades.");
+         CloseAllPositions();
+         dailyTargetReached = true;
+         return;
+      }
+   }
+   else return;
+
+   // 3. New bar check
+   datetime barTime = iTime(_Symbol, _Period, 0);
+   if(barTime == lastBar || Bars(_Symbol, _Period) < 100) return;
+   lastBar = barTime;
+
+   // 4. Volatility filter
+   if(!IsVolatilitySufficient())
+   {
+      Comment("Low Volatility - Waiting...");
+      return;
+   }
+
+   // 5. Ichimoku signals
+   double tenkan[1], kijun[1], spanA[1], spanB[1];
+   if(CopyBuffer(hIchimoku, 0, 0, 1, tenkan) <= 0) return;
+   if(CopyBuffer(hIchimoku, 1, 0, 1, kijun)  <= 0) return;
+   if(CopyBuffer(hIchimoku, 2, 26, 1, spanA) <= 0) return;
+   if(CopyBuffer(hIchimoku, 3, 26, 1, spanB) <= 0) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // 6. Dynamic SL
+   double slDist = GetSigmaPriceDistance(SigmaMultiplier);
+   double minStop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   slDist = MathMax(slDist, minStop);
+
+   // 7. Entry conditions
+   if(spanA[0] > spanB[0] && ask > iClose(_Symbol, _Period, 26) && tenkan[0] > kijun[0])
+      PlaceSizedTrade(ORDER_TYPE_BUY, ask, slDist);
+   
+   else if(spanA[0] < spanB[0] && bid < iClose(_Symbol, _Period, 26) && tenkan[0] < kijun[0])
+      PlaceSizedTrade(ORDER_TYPE_SELL, bid, slDist);
+}
+
+//+------------------------------------------------------------------+
+//| Place trade with proper sizing                                  |
+//+------------------------------------------------------------------+
+void PlaceSizedTrade(int dir, double entryPrice, double slDist)
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0) return;
+
+   // Calculate lot size
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double pipValuePerLot = tickValue * 10.0;
+   double profitTarget = equity * (DesiredProfitPct / 100.0);
+   double rawLot = profitTarget / (pipValuePerLot * FixedPips);
+   double lot = AdjustLot(rawLot);
+   if(lot <= 0) return;
+
+   // Set TP/SL prices
+   double tpDist = FixedPips * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tpPrice = (dir == ORDER_TYPE_BUY) ? entryPrice + tpDist : entryPrice - tpDist;
+   double slPrice = (dir == ORDER_TYPE_BUY) ? entryPrice - slDist : entryPrice + slDist;
+
+   // Validate stops
+   double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(MathAbs(entryPrice - slPrice) < minStopLevel || MathAbs(tpPrice - entryPrice) < minStopLevel)
+      return;
+
+   // Execute trade
+   trade.SetDeviationInPoints(Slippage);
+   bool ok = (dir == ORDER_TYPE_BUY) ? 
+      trade.Buy(lot, NULL, 0, slPrice, tpPrice, "Ichimoku_1pct") :
+      trade.Sell(lot, NULL, 0, slPrice, tpPrice, "Ichimoku_1pct");
+
+   if(!ok)
+      Print("Trade failed: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                             |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == INVALID_HANDLE || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      if(!trade.PositionClose(ticket))
+         Print("Failed to close position ", ticket, ": ", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate σ-based stop distance                                 |
+//+------------------------------------------------------------------+
+double GetSigmaPriceDistance(double multiplier)
+{
+   const int daysToFetch = 13;
+   double dailyCloses[];
+   ArraySetAsSeries(dailyCloses, true);
+
+   if(CopyClose(_Symbol, PERIOD_D1, 1, daysToFetch, dailyCloses) < daysToFetch)
+      return 0.0;
+
+   int retCount = daysToFetch - 1;
+   double returnsArr[], sum = 0.0;
+   ArrayResize(returnsArr, retCount);
+
+   for(int i = 0; i < retCount; i++)
+   {
+      returnsArr[i] = (dailyCloses[i] - dailyCloses[i+1]) / dailyCloses[i+1];
+      sum += returnsArr[i];
+   }
+
+   double mean = sum / retCount;
+   double sqSum = 0.0;
+   for(int i = 0; i < retCount; i++)
+      sqSum += MathPow(returnsArr[i] - mean, 2);
+
+   double sigmaReturn = MathSqrt(sqSum / (retCount - 1));
+   if(sigmaReturn <= 0) return 0.0;
+
+   return SymbolInfoDouble(_Symbol, SYMBOL_BID) * (sigmaReturn * multiplier);
+}
